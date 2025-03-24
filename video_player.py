@@ -130,28 +130,34 @@ class VideoLoaderThread(QThread):
 
 class VideoPlayerWindow(QMainWindow):
     frame_updated = pyqtSignal()
-    slider_changed_signal = pyqtSignal()
     
     def __init__(self, file_path: str = None, parent=None, sync_group: Optional['SyncGroup'] = None):
         super().__init__(parent)
         self.file_path = file_path
+        self.sync_group = sync_group
+        
+        # Video playback variables
         self.current_frame = None
         self.current_frame_index = 0
         self.total_frames = 0
         self.fps = 30
+        self.playback_speed = 1.0
         self.is_playing = False
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.next_frame)
-        self.sync_group = sync_group
         self.loader_thread = None
+        self.last_update_time = time.time()
+        self.frame_update_pending = False
         
         # Initialize UI
         self.init_ui()
         
+        # Set up the timer for playback
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_frame)
+        
         # Load video if path is provided
         if file_path:
             self.load_video(file_path)
-
+    
     def init_ui(self):
         # Set window properties
         self.setWindowTitle("Video Player")
@@ -354,7 +360,7 @@ class VideoPlayerWindow(QMainWindow):
         
         # Initialize and start the loader thread
         self.loader_thread = VideoLoaderThread(file_path)
-        self.loader_thread.loading_finished.connect(self.on_loading_finished)
+        self.loader_thread.loading_finished.connect(self._on_loading_finished_preserve_position)
         self.loader_thread.error_occurred.connect(self.on_error)
         self.loader_thread.start()
         
@@ -472,7 +478,7 @@ class VideoPlayerWindow(QMainWindow):
         self.play_button.setToolTip("Pause")
         
         # Calculate timer interval based on FPS and playback speed
-        interval = int(1000 / (self.fps * 1.0))
+        interval = int(1000 / (self.fps * self.playback_speed))
         self.timer.start(interval)
         
         # Notify sync group if master
@@ -532,15 +538,29 @@ class VideoPlayerWindow(QMainWindow):
             self.start_playback()
     
     def slider_changed(self):
-        # Get the current value of the slider
+        if not self.loader_thread or self.total_frames == 0:
+            return
+            
+        # Get the frame index from the slider
         frame_index = self.frame_slider.value()
         
-        # Only seek if the frame index has changed
+        # Update current frame display
+        self.current_frame_display.setText(str(frame_index))
+        
+        # Only seek if the frame index has actually changed
         if frame_index != self.current_frame_index:
+            # Pause playback temporarily
+            was_playing = self.is_playing
+            if was_playing:
+                self.stop_playback()
+                
+            # Seek to the requested frame
             self._seek_to_frame(frame_index)
-            # Emit slider changed signal
-            self.slider_changed_signal.emit()
-
+            
+            # Resume playback if it was playing
+            if was_playing:
+                self.start_playback()
+    
     def _seek_to_frame(self, frame_index):
         # Stop current loader thread
         if self.loader_thread:
@@ -602,7 +622,7 @@ class VideoPlayerWindow(QMainWindow):
         
         # Update timer interval if playing
         if self.is_playing:
-            interval = int(1000 / (self.fps * 1.0))
+            interval = int(1000 / (self.fps * self.playback_speed))
             self.timer.start(interval)
             
         # Notify sync group if master
@@ -696,72 +716,34 @@ class OverlayManager:
         self.blend_mode: str = "Normal"  # Normal, Add, Multiply, Screen, Difference
         self.opacity: float = 0.5  # 0.0 to 1.0
         self.is_active: bool = False
-        self.result_window: Optional['OverlayResultWindow'] = None
     
     def set_main_player(self, player: 'VideoPlayerWindow'):
         self.main_player = player
-        # Disconnect from previous player if exists
-        if hasattr(self, '_prev_main_player') and self._prev_main_player:
-            try:
-                self._prev_main_player.frame_updated.disconnect(self.update_overlay)
-                self._prev_main_player.slider_changed_signal.disconnect(self.update_overlay)
-            except (TypeError, AttributeError):
-                pass
-        
-        # Connect to new player
-        if player:
-            player.frame_updated.connect(self.update_overlay)
-            if not hasattr(player, 'slider_changed_signal'):
-                player.slider_changed_signal = pyqtSignal()
-                player.slider.valueChanged.connect(player.slider_changed_signal.emit)
-            player.slider_changed_signal.connect(self.update_overlay)
-        
-        # Store reference to current player for future disconnection
-        self._prev_main_player = player
     
     def set_overlay_player(self, player: 'VideoPlayerWindow'):
         self.overlay_player = player
-        # Disconnect from previous player if exists
-        if hasattr(self, '_prev_overlay_player') and self._prev_overlay_player:
-            try:
-                self._prev_overlay_player.frame_updated.disconnect(self.update_overlay)
-                self._prev_overlay_player.slider_changed_signal.disconnect(self.update_overlay)
-            except (TypeError, AttributeError):
-                pass
-        
-        # Connect to new player
-        if player:
-            player.frame_updated.connect(self.update_overlay)
-            if not hasattr(player, 'slider_changed_signal'):
-                player.slider_changed_signal = pyqtSignal()
-                player.slider.valueChanged.connect(player.slider_changed_signal.emit)
-            player.slider_changed_signal.connect(self.update_overlay)
-        
-        # Store reference to current player for future disconnection
-        self._prev_overlay_player = player
     
     def set_blend_mode(self, mode: str):
         self.blend_mode = mode
-        self.update_overlay()
     
     def set_opacity(self, opacity: float):
         self.opacity = max(0.0, min(1.0, opacity))
-        self.update_overlay()
     
     def activate(self):
         self.is_active = True
-        # Create result window if not exists
-        if not self.result_window:
-            self.result_window = OverlayResultWindow("オーバーレイ結果")
-            self.result_window.show()
-        self.update_overlay()
+        if self.main_player and self.overlay_player:
+            # Connect signals for frame updates
+            self.main_player.frame_updated.connect(self.update_overlay)
     
     def deactivate(self):
         self.is_active = False
-        # Close result window if exists
-        if self.result_window:
-            self.result_window.close()
-            self.result_window = None
+        if self.main_player:
+            # Disconnect signals
+            try:
+                self.main_player.frame_updated.disconnect(self.update_overlay)
+            except TypeError:
+                # Signal was not connected
+                pass
     
     def update_overlay(self):
         if not self.is_active or not self.main_player or not self.overlay_player:
@@ -776,9 +758,8 @@ class OverlayManager:
                 self.opacity
             )
             
-            # Display the blended frame in result window
-            if self.result_window:
-                self.result_window.display_frame(blended_frame)
+            # Display the blended frame
+            self.main_player.display_frame(blended_frame)
     
     def blend_frames(self, main_frame: np.ndarray, overlay_frame: np.ndarray, 
                      blend_mode: str, opacity: float) -> np.ndarray:
@@ -829,44 +810,6 @@ class OverlayManager:
         
         return result
 
-class OverlayResultWindow(QMainWindow):
-    def __init__(self, title):
-        super().__init__()
-        self.setWindowTitle(title)
-        self.setMinimumSize(800, 600)
-        
-        # Create central widget and layout
-        central_widget = QWidget()
-        layout = QVBoxLayout(central_widget)
-        
-        # Create image label
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(640, 480)
-        layout.addWidget(self.image_label)
-        
-        self.setCentralWidget(central_widget)
-    
-    def display_frame(self, frame):
-        if frame is None:
-            return
-        
-        try:
-            # Convert frame to QImage
-            height, width, channel = frame.shape
-            bytes_per_line = 3 * width
-            q_img = QImage(frame.data, width, height, bytes_per_line, QImage.Format_RGB888)
-            
-            # Convert QImage to QPixmap and display
-            pixmap = QPixmap.fromImage(q_img)
-            self.image_label.setPixmap(pixmap.scaled(
-                self.image_label.size(),
-                Qt.KeepAspectRatio,
-                Qt.FastTransformation
-            ))
-        except Exception as e:
-            print(f"Error displaying frame: {e}")
-
 class OverlayDialog(QDialog):
     def __init__(self, parent, players):
         super().__init__(parent)
@@ -903,10 +846,6 @@ class OverlayDialog(QDialog):
             }
             QPushButton:pressed {
                 background-color: #0062A3;
-            }
-            QPushButton:disabled {
-                background-color: #555555;
-                color: #888888;
             }
             QRadioButton {
                 color: #E0E0E0;
